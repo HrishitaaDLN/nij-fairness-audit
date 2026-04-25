@@ -1,0 +1,148 @@
+# NIJ Recidivism Forecasting — ML + Algorithmic Fairness Pipeline
+
+> **NIJ 2021 Recidivism Forecasting Challenge** | Georgia parole cohort (2013–2015) | 25,835 individuals
+
+A full ML pipeline for 3-year recidivism prediction with rigorous algorithmic fairness auditing, bias mitigation, and SHAP-based proxy detection. Built on the real NIJ 2021 challenge dataset, this project goes beyond prediction accuracy to formally quantify and mitigate disparate impact across race, gender, and intersectional subgroups.
+
+---
+
+## Key Findings
+
+| Finding | Detail |
+|---|---|
+| **Gender > Race** | Gender gap (10.5-pp) is the primary fairness driver — not race (2.8-pp). Opposite of COMPAS-style analyses. |
+| **Y2 Racial Gap Reverses** | WHITE has *higher* unconditional Year 2 recidivism (18.4% vs 17.7%) due to survivorship effects. |
+| **NIJFM Design Flaw** | Predicting all-zeros nearly optimises the official NIJ fairness metric — a documented metric vulnerability. |
+| **Informative Missingness** | `Gang_Affiliated` is missing in a race-dependent pattern (65.8% WHITE) — not missing-at-random. |
+| **Proxy Channels** | `Supervision_Risk_Score_First` and `Residence_PUMA_*` are the primary SHAP channels encoding race. |
+
+---
+
+## Project Structure
+
+```
+├── nij_recidivism_v5_final.ipynb   # Full pipeline notebook
+├── plots/                          # All generated visualisations
+│   ├── 2a_class_dist.png
+│   ├── 2b_intersectional_base.png
+│   ├── 2c_temporal.png
+│   ├── 4_calibration.png
+│   ├── 5d_fairness_metrics.png
+│   ├── 5e_intersect_heatmap.png
+│   ├── 5f_calibration_fairness.png
+│   ├── 5g_roc_by_group.png
+│   ├── 6_temporal_fairness.png
+│   ├── 6_kaplan_meier.png
+│   ├── 6_calibration_drift.png
+│   ├── 8_comparison_heatmap.png
+│   ├── 8_tradeoff.png
+│   ├── 9a_shap_bar.png
+│   ├── 9b_shap_beeswarm.png
+│   ├── 9c_proxy.png
+│   └── 9d_proxy_intersect.png
+└── README.md
+```
+
+> **Dataset**: Download from the [NIJ 2021 Recidivism Challenge](https://nij.ojp.gov/funding/recidivism-forecasting-challenge) and place as `nij_challenge2021_full_dataset.csv` in the root directory.
+
+---
+
+## Pipeline Overview
+
+### 1. Exploratory Data Analysis
+- Class balance and group base rate breakdown (Race, Gender, Intersectional)
+- Corrects a widespread error: the racial recidivism gap in this dataset is **2.8-pp**, not the 8-10-pp commonly cited for COMPAS — gender is the larger driver at 10.5-pp
+- Unconditional vs conditional rate distinction — conflating these is a common error in recidivism research
+- Missing data audit with race-stratified breakdown of `Gang_Affiliated` null values
+
+### 2. Preprocessing
+- **`_v1–_v4` column identification**: Four columns in this CSV have placeholder names. Cross-referencing column positions and value distributions against the NIJ codebook identified them as `Prior_Arrest_Episodes_PPVioCharge`, `Prior_Conviction_Episodes_PPVioCharge`, `Prior_Conviction_Episodes_NNSVSex`, and `Prior_Conviction_Episodes_VCrim`. Leaving these unencoded causes XGBoost to crash silently.
+- **Informative missingness fix**: Added `Gang_Affiliated_Missing` binary indicator before imputation (Kamiran-Calders approach) — imputing `'No'` directly would introduce systematic racial bias.
+- **Ordinal encoding** for 17 bucketed categorical columns
+- **One-hot encoding** for `Residence_PUMA` (25 geographic zones, treated as nominal)
+- **Conditional survival cohorts**: Year 2 model trains/tests on Year 1 survivors only; Year 3 on Year 1+2 survivors — correctly frames each as a conditional probability
+- Sensitive attributes (`Race`, `Gender`) stored separately and never included in the feature matrix
+
+### 3. Model Training
+Three separate XGBoost models trained for Year 1 (pre-release features only), Year 2, and Year 3 (conditional survival cohorts with post-release supervision features):
+
+| Component | Detail |
+|---|---|
+| **Tuning** | `RandomizedSearchCV` over 9 hyperparameters, 40 iterations, 5-fold `StratifiedKFold` |
+| **Class imbalance** | `scale_pos_weight = negatives / positives` |
+| **Baselines** | Logistic Regression + Random Forest compared on Year 1 |
+| **Calibration** | Calibration curves for all models — AUC measures ranking; calibration measures probability trustworthiness |
+
+### 4. Fairness Audit
+
+Metrics computed across **Race**, **Gender**, and **Intersectional (Race × Gender)** groups for all 3 years:
+
+| Metric | Description |
+|---|---|
+| FPR / TPR / FNR / PPV | Standard confusion-matrix rates per group |
+| Selection Rate | Predicted positive rate per group |
+| **NIJFM** | Official NIJ metric: `(1 − MSE) × (1 − |FPR_Black − FPR_White|)` |
+| Bootstrap 95% CI | 500-sample bootstrap confidence intervals on all fairness gaps |
+| Per-group AUC | Separate ROC curves per demographic group |
+| Per-group calibration | Calibration curves by Race, Gender, and all 4 intersectional groups |
+
+**Intersectional analysis** reveals fairness gerrymandering: a model can pass Race fairness AND Gender fairness independently while being miscalibrated for a specific subgroup (e.g., BLACK_F).
+
+### 5. Temporal Fairness
+- Fairness gaps tracked across Year 1 → Year 2 → Year 3
+- **Kaplan–Meier survival curves** by Race, Gender, and Intersectional group
+- **Log-rank tests** (formal significance testing of survival curve differences)
+- Calibration drift analysis across conditional cohorts
+
+### 6. Bias Mitigation
+
+Three techniques compared, applied to Year 1:
+
+| Method | Type | Description |
+|---|---|---|
+| **Kamiran-Calders Reweighing** | Pre-processing | Correct formula: `w(s,y) = P(S)·P(Y) / P(S,Y)`. Equalises label distribution across groups in weighted training space. |
+| **ThresholdOptimizer** | Post-processing | Group-specific decision thresholds targeting equalised odds. Probabilities unchanged — only binary decisions shift. |
+| **ExponentiatedGradient** | In-processing | Retrains model under equalized odds constraint. More principled than threshold manipulation; higher accuracy cost. |
+
+All mitigation variants applied for both **Race** and **Intersectional (Race × Gender)** sensitive attributes (6 total variants).
+
+### 7. SHAP Proxy Analysis
+- Global feature importance (bar + beeswarm plots, top 20 features)
+- **Proxy detection**: Pearson correlation between each feature's SHAP values and `Race_enc` / `Gender_enc` / `Intersect_enc`
+- Flags `Supervision_Risk_Score_First` and `Residence_PUMA_*` as primary discrimination channels — the model inherits prior system bias through these features even though race is excluded from the feature matrix
+
+---
+
+## Results Summary
+
+| Model | AUC | Bal. Acc | NIJFM | FPR Gap (Race) | FPR Gap (Gender) | FPR Gap (Intersect) |
+|---|---|---|---|---|---|---|
+| XGBoost Baseline | — | — | — | — | — | — |
+| + Reweighing (KC) | — | — | — | — | — | — |
+| + ThresholdOpt (Race) | N/A | — | — | — | — | — |
+| + EG (Race) | — | — | — | — | — | — |
+| + ThresholdOpt (Intersect) | N/A | — | — | — | — | — |
+| + EG (Intersect) | — | — | — | — | — | — |
+
+> *Run the notebook to populate the results table with your local model outputs.*
+
+---
+
+## Installation
+
+```bash
+pip install xgboost shap scikit-learn pandas numpy matplotlib seaborn scipy
+pip install lifelines fairlearn
+```
+
+**Python**: 3.9+
+
+---
+
+## References
+
+- Mohler & Porter (2021) — NIJ Fairness Metric design and documented flaw
+- Kamiran & Calders (2012) — *Data preprocessing techniques for classification without discrimination*
+- Chouldechova (2017) — *Fair prediction with disparate impact: A study of bias in recidivism prediction instruments*
+- Little & Rubin (2002) — *Statistical Analysis with Missing Data*
+- Bird et al. (2020) — Fairlearn: A toolkit for assessing and improving fairness in AI
